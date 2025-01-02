@@ -10,373 +10,351 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
-#include <sys/stat.h>
+
 #include "tokenizer.h"
 
-/* 定义一个宏，用于消除未使用参数的编译器警告 */
+/* Convenience macro to silence compiler warnings about unused function parameters. */
 #define unused __attribute__((unused))
 
-/* 枚举类型，用于区分输入、输出和其他操作 */
-typedef enum IORe
-{
-  in,    // 输入重定向
-  out,   // 输出重定向
-  other  // 其他操作
-} IORe_t;
-
-/* 全局变量，用于存储文件描述符 */
-int Oid;
-int Aid;
-
-/* 判断shell是否是交互模式 */
+/* Whether the shell is connected to an actual terminal or not. */
 bool shell_is_interactive;
 
-/* shell的文件描述符 */
+/* File descriptor for the shell input */
 int shell_terminal;
 
-/* shell的终端模式 */
+/* Terminal mode settings for the shell */
 struct termios shell_tmodes;
 
-/* shell的进程组ID */
+/* Process group id for the shell */
 pid_t shell_pgid;
 
-/* 当前子进程ID */
-pid_t Cpid;
-
-/* 函数声明 */
-char *path_res(char *file);
+char *get_fullpath(char *name);
 int exe(unused struct tokens *argvs, bool backPro);
-int mine_wait(struct tokens *argvs);
-int mine_exit(struct tokens *argvs);
-int mine_help(struct tokens *argvs);
-int mine_pwd(struct tokens *argvs);
-int mine_changedir(struct tokens *argvs);
+int cmd_wait(struct tokens *argvs);
+int cmd_exit(struct tokens* tokens);
+int cmd_help(struct tokens* tokens);
+int cmd_cd(struct tokens* tokens);
+int cmd_pwd(struct tokens* tokens);
+int cmd_changedir(struct tokens *argvs);
 
-/* 内建命令的函数类型 */
-typedef int mine_fun_t(struct tokens *argvs);
+/* Built-in command functions take token array (see parse.h) and return int */
+typedef int cmd_fun_t(struct tokens* tokens);
 
-/* 内建命令结构和查找表 */
-typedef struct fun_desc
-{
-  mine_fun_t *fun;   // 函数指针
-  char *mine;        // 命令名称
-  char *doc;         // 命令说明
+/* Built-in command struct and lookup table */
+typedef struct fun_desc {
+  cmd_fun_t* fun;
+  char* cmd;
+  char* doc;
 } fun_desc_t;
 
-/* 定义内建命令表 */
-fun_desc_t mine_table[] = {
-    {mine_help, "?", "显示帮助菜单"},
-    {mine_exit, "exit", "退出命令行shell"},
-    {mine_pwd, "pwd", "显示当前工作目录"},
-    {mine_changedir, "cd", "切换到指定目录"},
-    {mine_wait, "wait", "等待子进程结束"}
+struct ch_process {
+	int tokens_len;
+	int next_token;
+	char **args;
+	int in_fd;
+	int out_fd;
+	int out_attr;
 };
 
-/* 路径解析函数，查找可执行文件路径 */
-char *path_res(char *file)
-{
-  char *PATH = getenv("PATH");
-  char *path = (char *)calloc(1024, sizeof(char));
-  char *Cpath = PATH;
+fun_desc_t cmd_table[] = {
+    {cmd_help, "?", "show this help menu"},
+    {cmd_exit, "exit", "exit the command shell"},
+    {cmd_cd, "cd", "change the working directory" },
+	  {cmd_pwd, "pwd", "print name of current/working directory" },
+    {cmd_wait, "wait", "wait for the child process to terminate!" },
+};
 
-  while (true) {
-    char *next_path = strchr(Cpath, ':');
-    if (!next_path) {
-      next_path = strchr(Cpath, '0');
-    }
-    size_t len = next_path - Cpath;
-    strncpy(path, Cpath, len);
-    path[len] = 0;
-
-    strcat(path, "/");
-    strcat(path, file);
-    if (!access(path, F_OK)) {
-      return path;
-    }
-
-    if (*next_path) {
-      Cpath = next_path + 1;
-    } else {
-      break;
-    }
-  }
-
-  free(path);
-  return NULL;
-}
-
-/* 输入/输出重定向函数 */
-void IORe(char *FileName, IORe_t QPro)
-{
-  if (FileName == NULL)
-    return;
-
-  int current_id;
-  switch (QPro)
-  {
-  case in: // 输入重定向
-    current_id = STDIN_FILENO;
-    Aid = open(FileName, O_RDONLY);
-    if (-1 == Aid)
-      perror("打开文件出错！");
-    Oid = dup(STDIN_FILENO);
-    if (-1 == Oid)
-      perror("复制文件描述符出错！");
-    break;
-
-  case out: // 输出重定向
-    current_id = STDOUT_FILENO;
-    Aid = creat(FileName, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
-    if (-1 == Aid)
-      perror("创建文件出错！");
-    Oid = dup(STDOUT_FILENO);
-    if (-1 == Oid)
-      perror("复制文件描述符出错！");
-    break;
-
-  default:
-    break;
-  }
-  dup2(Aid, current_id);
-  close(Aid);
-}
-
-/* 执行命令函数 */
-int exe(unused struct tokens *argvs, bool backPro)
-{
-  int length = tokens_get_length(argvs);
-  if (length <= 0)
-  {
-    printf("没有命令！\n");
-    return -1;
-  }
-
-  char **argv = (char **)calloc(length + 1, sizeof(char *));
-  int argv_index = 0;
-  char *FileName;
-  IORe_t QPro;
-
-  for (int i = 0; i < length; ++i)
-  {
-    char *current_token = tokens_get_token(argvs, i);
-    if (!strcmp(current_token, "<"))
-      QPro = in;
-    else if (!strcmp(current_token, ">"))
-      QPro = out;
-    else
-      QPro = other;
-
-    if (QPro == other)
-    {
-      argv[argv_index++] = current_token;
-    }
-    else
-    {
-      FileName = tokens_get_token(argvs, ++i);
-      IORe(FileName, QPro);
-      break;
-    }
-  }
-
-  char *ProName = argv[0];
-  ProName = path_res(ProName);
-  char **args = (char **)malloc(length * sizeof(char *) + 1);
-  args[0] = ProName;
-
-  if (QPro != other)
-    length -= 2;
-  if (backPro)
-    length -= 1;
-
-  for (int i = 1; i < length; i++)
-  {
-    args[i] = argv[i];
-  }
-
-  int res = execv(ProName, args);
-  if (-1 == res)
-  {
-    perror("执行命令失败！");
-    free(args);
-    return -1;
-  }
-
-  free(args);
-  free(argv);
+/* Prints a helpful description for the given command */
+int cmd_help(unused struct tokens* tokens) {
+  for (unsigned int i = 0; i < sizeof(cmd_table) / sizeof(fun_desc_t); i++)
+    printf("%s - %s\n", cmd_table[i].cmd, cmd_table[i].doc);
   return 1;
 }
 
-/* 等待子进程结束 */
-int mine_wait(struct tokens *argvs)
+#define shell_msg(FORMAT, ...) \
+do {\
+	if (shell_is_interactive) { \
+		fprintf(stdout, FORMAT, ##__VA_ARGS__);\
+	} \
+} while(0)
+
+/* change working directory */
+int cmd_cd(unused struct tokens *tokens)
 {
-  int sta;
-  int pid = waitpid(Oid, &sta, WUNTRACED);
-  while (pid)
-  {
-    if (pid == -1)
-    {
-      printf("等待出错！\n");
-      break;
+	char *dst = NULL;
+	int res = -1;
+
+	switch (tokens_get_length(tokens)) {
+	case 1:	/* no directory operand is given, if HOME is given, cd $HOME */
+		dst = getenv("HOME");
+		break;
+	case 2:
+		dst = tokens_get_token(tokens, 1);
+		break;
+	default:
+		shell_msg("too many argument\n");
+	}
+	if (dst == NULL)
+		return -1;
+	res = chdir(dst);
+	if (res == -1)
+		shell_msg("No such file or directory\n");
+	return res;
+}
+
+/* get current full path */
+int cmd_pwd(unused struct tokens *tokens)
+{
+	char *path = getcwd(NULL, 0);
+	if (path == NULL) {
+		shell_msg("%s\n", strerror(errno));
+		return -1;
+	}
+	printf("%s\n", path);
+	free(path);
+	return 0;
+}
+
+char *get_fullpath(char *name)
+{
+	char *val = getenv("PATH");
+	int i, j, len;
+	char *path = (char *)malloc(BUFSIZ);
+	/* if name is already full path */
+	strcpy(path, name);
+	if (access(path, X_OK) == 0)
+		return path;
+	/* enumerate $PATH and search reachable path */
+	len = strlen(val);
+	i = 0;
+	while (i < len) {
+		j = i;
+		while (j < len && val[j] != ':')
+			j++;
+		int k = j - i;
+		memset(path, 0, BUFSIZ);
+		strncpy(path, val + i, k);
+		path[k] = '/';
+		strcpy(path + k + 1, name);
+		if (access(path, X_OK) == 0)
+			return path;
+		i = j + 1;
+	}
+	free(path);
+	return NULL;
+}
+
+
+void parse_args(struct ch_process *ch, struct tokens *tokens)
+{
+	char *token;
+	int finish = 0;
+	while (ch->next_token < ch->tokens_len && !finish) {
+		token = tokens_get_token(tokens, ch->next_token);
+		/* if first char of token is < or >, break */
+		finish = (token[0] == '<' || token[0] == '>');
+		/* if not finish, !finish 1, then args[next_token] = token, then next_token inccrease
+		else if finish, args[next_token] = NULL, and next_token refer to the first < or > or >> */
+		/* This line may be hard to understand, but it can avoid IF branch */
+		ch->args[ch->next_token] = (char *)((!finish) * (int64_t)(void*)(token));
+		ch->next_token += !finish;
+	}
+	ch->args[ch->next_token] = NULL;
+}
+
+void parse_redirection(struct ch_process *ch, struct tokens *tokens) {
+    char *arrow, *path;
+
+    while (ch->next_token < ch->tokens_len) {
+        // Get redirection operator ('<', '>', or '>>')
+        arrow = tokens_get_token(tokens, ch->next_token++);
+        
+        // Ensure there is a file path after the operator
+        if (ch->next_token >= ch->tokens_len) {
+            fprintf(stderr, "No file specified after '%s'\n", arrow);
+            return;
+        }
+        path = tokens_get_token(tokens, ch->next_token++);
+
+        switch (arrow[0]) {
+            case '<':
+                // Redirect input
+                if (access(path, R_OK) == 0) {
+                    if (ch->in_fd != 0) {
+                        close(ch->in_fd);
+                    }
+                    ch->in_fd = open(path, O_RDONLY);
+                } else {
+                    fprintf(stderr, "%s does not exist or is not readable\n", path);
+                    return;
+                }
+                break;
+
+            case '>':
+                // Redirect output
+                ch->out_attr = O_WRONLY | O_CREAT;
+                if (arrow[1] == '>') {
+                    ch->out_attr |= O_APPEND;
+                } else {
+                    ch->out_attr |= O_TRUNC;
+                }
+
+                if (ch->out_fd != 1) {
+                    close(ch->out_fd);
+                }
+                ch->out_fd = open(path, ch->out_attr, 0664);
+                if (ch->out_fd == -1) {
+                    perror("Failed to open file for output");
+                    return;
+                }
+                break;
+
+            default:
+                fprintf(stderr, "Unknown redirection operator: '%s'\n", arrow);
+                return;
+        }
     }
-    else
-    {
-      printf("子进程 #%d 已结束。\n", pid);
-      break;
+}
+
+/* start a child process to execute program */
+int run_program(struct tokens *tokens) {
+    int tokens_len = tokens_get_length(tokens);
+    if (tokens_len == 0) {  /* no input */
+        exit(0);
     }
-  }
-  return 0;
-}
 
-/* 帮助命令 */
-int mine_help(unused struct tokens *argvs)
-{
-  for (unsigned int i = 0; i < sizeof(mine_table) / sizeof(fun_desc_t); i++)
-    printf("%s - %s\n", mine_table[i].mine, mine_table[i].doc);
-  return 1;
-}
+    // Initialize child process struct
+    char *args[tokens_len + 1];
+    struct ch_process child = { 0 };
+    child.tokens_len = tokens_len;
+    child.next_token = 0;
+    child.args = args;
+    child.in_fd = 0;   // Default input: stdin
+    child.out_fd = 1;  // Default output: stdout
 
-/* 显示当前目录 */
-int mine_pwd(unused struct tokens *argvs)
-{
-  char buffer[1024];
-  getcwd(buffer, 1024);
-  if (buffer == NULL)
-  {
-    perror("获取当前目录出错！");
-    return -1;
-  }
-  else
-  {
-    printf("%s\n", buffer);
-    return 1;
-  }
-}
+    // Parse arguments (extract command-line args, ignoring redirection symbols)
+    parse_args(&child, tokens);
 
-/* 切换目录 */
-int mine_changedir(unused struct tokens *argvs)
-{
-  char *argument = tokens_get_token(argvs, 1);
-  if (!argument)
-  {
-    char *home_dir = getenv("HOME");
-    if (home_dir)
-      chdir(home_dir);
-    else
-    {
-      fprintf(stderr, "cd: HOME 未设置\n");
-      return -1;
+    // Parse redirection symbols (<, >, >>)
+    parse_redirection(&child, tokens);
+
+    // Fork the process to execute the command
+    pid_t chpid = fork();
+    if (chpid < 0) {  /* fork error */
+        shell_msg("fork: %s\n", strerror(errno));
+        return -1;
+    } else if (chpid == 0) {  /* child process */
+        // Handle input redirection
+        if (child.in_fd != 0) {
+            dup2(child.in_fd, 0);  // Redirect stdin
+        }
+
+        // Handle output redirection
+        if (child.out_fd != 1) {
+            dup2(child.out_fd, 1);  // Redirect stdout
+        }
+
+        // Close unused file descriptors
+        if (child.in_fd != 0) {
+            close(child.in_fd);
+        }
+        if (child.out_fd != 1) {
+            close(child.out_fd);
+        }
+
+        // Execute the program
+        execvp(child.args[0], child.args);
+
+        // If execvp fails
+        shell_msg("execvp: %s\n", strerror(errno));
+        exit(1);
     }
-  }
-  else
-  {
-    chdir(argument);
-  }
-  return 1;
+
+    // Parent process: Wait for child to complete
+    if (wait(NULL) == -1) {
+        shell_msg("wait: %s\n", strerror(errno));
+        return -1;
+    }
+
+    // Close file descriptors in parent process
+    if (child.in_fd != 0) {
+        close(child.in_fd);
+    }
+    if (child.out_fd != 1) {
+        close(child.out_fd);
+    }
+
+    return 0;
 }
 
-/* 退出命令 */
-int mine_exit(unused struct tokens *argvs) { exit(0); }
 
-/* 查找内建命令 */
-int lookup(char mine[])
-{
-  for (unsigned int i = 0; i < sizeof(mine_table) / sizeof(fun_desc_t); i++)
-    if (mine && (strcmp(mine_table[i].mine, mine) == 0))
+/* Exits this shell */
+int cmd_exit(unused struct tokens* tokens) { exit(0); }
+
+/* Looks up the built-in command, if it exists. */
+int lookup(char cmd[]) {
+  for (unsigned int i = 0; i < sizeof(cmd_table) / sizeof(fun_desc_t); i++)
+    if (cmd && (strcmp(cmd_table[i].cmd, cmd) == 0))
       return i;
   return -1;
 }
 
-/* 初始化shell */
-void init_shell()
-{
+/* Intialization procedures for this shell */
+void init_shell() {
+  /* Our shell is connected to standard input. */
   shell_terminal = STDIN_FILENO;
+
+  /* Check if we are running interactively */
   shell_is_interactive = isatty(shell_terminal);
 
-  if (shell_is_interactive)
-  {
+  if (shell_is_interactive) {
+    /* If the shell is not currently in the foreground, we must pause the shell until it becomes a
+     * foreground process. We use SIGTTIN to pause the shell. When the shell gets moved to the
+     * foreground, we'll receive a SIGCONT. */
     while (tcgetpgrp(shell_terminal) != (shell_pgid = getpgrp()))
       kill(-shell_pgid, SIGTTIN);
 
+    /* Saves the shell's process id */
     shell_pgid = getpid();
+
+    /* Take control of the terminal */
     tcsetpgrp(shell_terminal, shell_pgid);
+
+    /* Save the current termios to a variable, so it can be restored later. */
     tcgetattr(shell_terminal, &shell_tmodes);
   }
 }
 
-/* 主函数 */
-int main(unused int argc, unused char *argv[])
-{
+int main(unused int argc, unused char* argv[]) {
   init_shell();
-  int sta;
+
   static char line[4096];
-  int Lindex = 0;
+  int line_num = 0;
 
+  /* Please only print shell prompts when standard input is not a tty */
   if (shell_is_interactive)
-    fprintf(stdout, "%d: ", Lindex);
+    fprintf(stdout, "%d: ", line_num);
 
-  while (fgets(line, 4096, stdin))
-  {
-    struct tokens *argvs = tokenize(line);
-    int Findex = lookup(tokens_get_token(argvs, 0));
-    size_t token_length = tokens_get_length(argvs);
-    bool backPro = false;
+  while (fgets(line, 4096, stdin)) {
+    /* Split our line into words. */
+    struct tokens* tokens = tokenize(line);
 
-    if (Findex >= 0)
-    {
-      mine_table[Findex].fun(argvs);
-    }
-    else
-    {
-      if (!strcmp(tokens_get_token(argvs, token_length - 1), "&"))
-        backPro = true;
+    /* Find which built-in function to run. */
+    int fundex = lookup(tokens_get_token(tokens, 0));
 
-      pid_t childPid = fork();
-      switch (childPid)
-      {
-      case -1:
-        perror("创建子进程失败");
-        exit(EXIT_FAILURE);
-      case 0:
-        exe(argvs, backPro);
-        _exit(0);
-      default:
-      {
-        Cpid = childPid;
-        int status;
-        setpgid(childPid, childPid);
-        if (tcsetpgrp(shell_terminal, Cpid) == 0)
-        {
-          if ((waitpid(Cpid, &status, WUNTRACED)) < 0)
-          {
-            perror("等待子进程失败");
-            _exit(2);
-          }
-          printf("\n");
-          signal(SIGTTOU, SIG_IGN);
-          if (tcsetpgrp(shell_terminal, shell_pgid) != 0)
-            printf("切换回shell时出错！\n");
-          signal(SIGTTOU, SIG_DFL);
-        }
-        else
-        {
-          printf("tcsetpgrp 出错\n");
-        }
-        break;
-      }
-      }
-
-      signal(SIGTTOU, SIG_IGN);
-      if (!backPro)
-      {
-        unused int ret = waitpid(-1, &sta, 0);
-        signal(SIGTTOU, SIG_DFL);
-      }
+    if (fundex >= 0) {
+      cmd_table[fundex].fun(tokens);
+    } else {
+      /* REPLACE this to run commands as programs. */
+      fprintf(stdout, "This shell doesn't know how to run programs.\n");
     }
 
     if (shell_is_interactive)
-      fprintf(stdout, "%d: ", ++Lindex);
+      /* Please only print shell prompts when standard input is not a tty */
+      fprintf(stdout, "%d: ", ++line_num);
 
-    tokens_destroy(argvs);
+    /* Clean up memory */
+    tokens_destroy(tokens);
   }
 
   return 0;
