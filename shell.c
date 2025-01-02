@@ -16,6 +16,10 @@
 /* Convenience macro to silence compiler warnings about unused function parameters. */
 #define unused __attribute__((unused))
 
+/* 全局变量，用于保存旧的文件描述符和新打开的文件描述符 */
+int Oid;
+int Aid;
+
 /* Whether the shell is connected to an actual terminal or not. */
 bool shell_is_interactive;
 
@@ -27,14 +31,13 @@ struct termios shell_tmodes;
 
 /* Process group id for the shell */
 pid_t shell_pgid;
+pid_t Cpid;
 
-char *get_fullpath(char *name);
-int exe(unused struct tokens *argvs, bool backPro);
-int cmd_wait(struct tokens *argvs);
 int cmd_exit(struct tokens* tokens);
 int cmd_help(struct tokens* tokens);
 int cmd_cd(struct tokens* tokens);
 int cmd_pwd(struct tokens* tokens);
+int cmd_wait(struct tokens *argvs);
 int cmd_changedir(struct tokens *argvs);
 
 /* Built-in command functions take token array (see parse.h) and return int */
@@ -47,13 +50,14 @@ typedef struct fun_desc {
   char* doc;
 } fun_desc_t;
 
+/* 子进程的参数解析结构体 */
 struct ch_process {
-	int tokens_len;
-	int next_token;
-	char **args;
-	int in_fd;
-	int out_fd;
-	int out_attr;
+    int tokens_len;      // Total number of tokens
+    int next_token;      // Current token index
+    char **args;         // Arguments list
+    int in_fd;           // Input file descriptor (default 0: stdin)
+    int out_fd;          // Output file descriptor (default 1: stdout)
+    int out_attr;        // File open attributes for output
 };
 
 fun_desc_t cmd_table[] = {
@@ -115,6 +119,81 @@ int cmd_pwd(unused struct tokens *tokens)
 	return 0;
 }
 
+int cmd_wait(struct tokens *argvs) {
+  int sta;
+  int pid = waitpid(Oid, &sta, WUNTRACED);
+  while (pid) {
+    if (pid == -1) {
+      printf("wait error!\n");
+      break;
+    } else {
+      printf("子进程 #%d 已终止。\n", pid);
+      break;
+    }
+  }
+  return 0;
+}
+
+int cmd_changedir(unused struct tokens *argvs) {
+  char *argument = tokens_get_token(argvs, 1);
+  if (!argument) {
+    char *home_dir = getenv("HOME");
+    if (home_dir) chdir(home_dir);
+    else {
+      fprintf(stderr, "cd: HOME 未设置\n");
+      return -1;
+    }
+  } else {
+    chdir(argument);
+  }
+  return 1;
+}
+
+/* start a child process to execute program */
+int run_program(struct tokens *tokens) {
+    int tokens_len = tokens_get_length(tokens);
+    if (tokens_len == 0) return 0;  // 无输入直接返回
+
+    char *args[tokens_len + 1];  // 参数数组，多预留一个 NULL
+    struct ch_process child = { 0 };
+    child.tokens_len = tokens_len;
+    child.next_token = 0;
+    child.args = args;
+    child.in_fd = 0;  // 默认 stdin
+    child.out_fd = 1; // 默认 stdout
+    child.out_attr = O_TRUNC;  // 默认覆盖输出
+
+    // 解析参数
+    parse_args(&child, tokens);
+
+    // 解析重定向
+    parse_redirection(&child, tokens);
+
+    // 创建子进程
+    pid_t chpid = fork();
+    if (chpid < 0) {
+        fprintf(stderr, "fork: %s\n", strerror(errno));
+        return -1;
+    } else if (chpid == 0) {
+        // 子进程：执行重定向
+        if (child.in_fd != 0) dup2(child.in_fd, 0);  // 重定向 stdin
+        if (child.out_fd != 1) dup2(child.out_fd, 1);  // 重定向 stdout
+
+        // 执行命令
+        execvp(args[0], args);
+        fprintf(stderr, "execvp: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    // 父进程：等待子进程完成
+    if (wait(NULL) == -1) {
+        fprintf(stderr, "wait: %s\n", strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
 char *get_fullpath(char *name)
 {
 	char *val = getenv("PATH");
@@ -144,147 +223,53 @@ char *get_fullpath(char *name)
 	return NULL;
 }
 
+void parse_args(struct ch_process *ch, struct tokens *tokens) {
+    char *token;
+    int finish = 0;
 
-void parse_args(struct ch_process *ch, struct tokens *tokens)
-{
-	char *token;
-	int finish = 0;
-	while (ch->next_token < ch->tokens_len && !finish) {
-		token = tokens_get_token(tokens, ch->next_token);
-		/* if first char of token is < or >, break */
-		finish = (token[0] == '<' || token[0] == '>');
-		/* if not finish, !finish 1, then args[next_token] = token, then next_token inccrease
-		else if finish, args[next_token] = NULL, and next_token refer to the first < or > or >> */
-		/* This line may be hard to understand, but it can avoid IF branch */
-		ch->args[ch->next_token] = (char *)((!finish) * (int64_t)(void*)(token));
-		ch->next_token += !finish;
-	}
-	ch->args[ch->next_token] = NULL;
+    while (ch->next_token < ch->tokens_len && !finish) {
+        token = tokens_get_token(tokens, ch->next_token);
+        finish = (token[0] == '<' || token[0] == '>');  // 遇到 < 或 > 停止解析
+        ch->args[ch->next_token] = (char *)((!finish) * (int64_t)(void *)(token));
+        ch->next_token += !finish;
+    }
+    ch->args[ch->next_token] = NULL;  // 参数数组以 NULL 结尾
 }
 
 void parse_redirection(struct ch_process *ch, struct tokens *tokens) {
     char *arrow, *path;
 
     while (ch->next_token < ch->tokens_len) {
-        // Get redirection operator ('<', '>', or '>>')
-        arrow = tokens_get_token(tokens, ch->next_token++);
-        
-        // Ensure there is a file path after the operator
+        arrow = tokens_get_token(tokens, ch->next_token++);  // 获取 <, >, 或 >>
         if (ch->next_token >= ch->tokens_len) {
-            fprintf(stderr, "No file specified after '%s'\n", arrow);
+            fprintf(stderr, "No file next to '%s'\n", arrow);
             return;
         }
-        path = tokens_get_token(tokens, ch->next_token++);
+        path = tokens_get_token(tokens, ch->next_token++);  // 获取文件路径
 
         switch (arrow[0]) {
-            case '<':
-                // Redirect input
+            case '<':  // 输入重定向
                 if (access(path, R_OK) == 0) {
-                    if (ch->in_fd != 0) {
-                        close(ch->in_fd);
-                    }
+                    if (ch->in_fd != 0) close(ch->in_fd);
                     ch->in_fd = open(path, O_RDONLY);
                 } else {
-                    fprintf(stderr, "%s does not exist or is not readable\n", path);
+                    fprintf(stderr, "%s is not exist or readable\n", path);
                     return;
                 }
                 break;
 
-            case '>':
-                // Redirect output
+            case '>':  // 输出重定向
                 ch->out_attr = O_WRONLY | O_CREAT;
                 if (arrow[1] == '>') {
-                    ch->out_attr |= O_APPEND;
+                    ch->out_attr |= O_APPEND;  // 追加模式
                 } else {
-                    ch->out_attr |= O_TRUNC;
+                    ch->out_attr |= O_TRUNC;  // 覆盖模式
                 }
-
-                if (ch->out_fd != 1) {
-                    close(ch->out_fd);
-                }
-                ch->out_fd = open(path, ch->out_attr, 0664);
-                if (ch->out_fd == -1) {
-                    perror("Failed to open file for output");
-                    return;
-                }
+                if (ch->out_fd != 1) close(ch->out_fd);
+                ch->out_fd = open(path, ch->out_attr, 0664);  // -rw-rw-r--
                 break;
-
-            default:
-                fprintf(stderr, "Unknown redirection operator: '%s'\n", arrow);
-                return;
         }
     }
-}
-
-/* start a child process to execute program */
-int run_program(struct tokens *tokens) {
-    int tokens_len = tokens_get_length(tokens);
-    if (tokens_len == 0) {  /* no input */
-        exit(0);
-    }
-
-    // Initialize child process struct
-    char *args[tokens_len + 1];
-    struct ch_process child = { 0 };
-    child.tokens_len = tokens_len;
-    child.next_token = 0;
-    child.args = args;
-    child.in_fd = 0;   // Default input: stdin
-    child.out_fd = 1;  // Default output: stdout
-
-    // Parse arguments (extract command-line args, ignoring redirection symbols)
-    parse_args(&child, tokens);
-
-    // Parse redirection symbols (<, >, >>)
-    parse_redirection(&child, tokens);
-
-    // Fork the process to execute the command
-    pid_t chpid = fork();
-    if (chpid < 0) {  /* fork error */
-        shell_msg("fork: %s\n", strerror(errno));
-        return -1;
-    } else if (chpid == 0) {  /* child process */
-        // Handle input redirection
-        if (child.in_fd != 0) {
-            dup2(child.in_fd, 0);  // Redirect stdin
-        }
-
-        // Handle output redirection
-        if (child.out_fd != 1) {
-            dup2(child.out_fd, 1);  // Redirect stdout
-        }
-
-        // Close unused file descriptors
-        if (child.in_fd != 0) {
-            close(child.in_fd);
-        }
-        if (child.out_fd != 1) {
-            close(child.out_fd);
-        }
-
-        // Execute the program
-        execvp(child.args[0], child.args);
-
-        // If execvp fails
-        shell_msg("execvp: %s\n", strerror(errno));
-        exit(1);
-    }
-
-    // Parent process: Wait for child to complete1
-    if (wait(NULL) == -1) {
-        shell_msg("wait: %s\n", strerror(errno));
-        return -1;
-    }
-
-    // Close file descriptors in parent process
-    if (child.in_fd != 0) {
-        close(child.in_fd);
-    }
-    if (child.out_fd != 1) {
-        close(child.out_fd);
-    }
-
-    return 0;
 }
 
 
@@ -326,36 +311,81 @@ void init_shell() {
 }
 
 int main(unused int argc, unused char* argv[]) {
-  init_shell();
+    // 初始化 shell 设置
+    init_shell();
 
-  static char line[4096];
-  int line_num = 0;
+    static char line[4096];  // 存储输入的命令行
+    int line_num = 0;        // 命令计数器
+    int sta;
 
-  /* Please only print shell prompts when standard input is not a tty */
-  if (shell_is_interactive)
-    fprintf(stdout, "%d: ", line_num);
-
-  while (fgets(line, 4096, stdin)) {
-    /* Split our line into words. */
-    struct tokens* tokens = tokenize(line);
-
-    /* Find which built-in function to run. */
-    int fundex = lookup(tokens_get_token(tokens, 0));
-
-    if (fundex >= 0) {
-      cmd_table[fundex].fun(tokens);
-    } else {
-      /* REPLACE this to run commands as programs. */
-      fprintf(stdout, "This shell doesn't know how to run programs.\n");
+    // 仅在交互模式下打印 shell 提示符
+    if (shell_is_interactive) {
+        fprintf(stdout, "%d: ", line_num);
     }
 
-    if (shell_is_interactive)
-      /* Please only print shell prompts when standard input is not a tty */
-      fprintf(stdout, "%d: ", ++line_num);
+    // 主循环：读取命令并执行
+    while (fgets(line, sizeof(line), stdin)) {
+        // 将输入行进行分词
+        struct tokens* argvs = tokenize(line);
 
-    /* Clean up memory */
-    tokens_destroy(tokens);
-  }
+        // 查找并执行对应的内置命令
+        int Findex = lookup(tokens_get_token(argvs, 0));
+        size_t token_length = tokens_get_length(argvs);
+        bool backPro = false;  // 是否是后台进程
 
-  return 0;
+        if (Findex >= 0) {
+            // 如果是内建命令，则执行相应函数
+            cmd_table[Findex].fun(argvs);
+        } else {
+            // 判断是否是后台命令（以 & 结尾）
+            if (!strcmp(tokens_get_token(argvs, token_length - 1), "&"))
+                backPro = true;
+
+            // 执行外部命令
+            pid_t childPid = fork();
+            switch (childPid) {
+                case -1:  // fork 错误
+                    perror("fork error");
+                    exit(EXIT_FAILURE);
+                case 0:  // 子进程
+                    exe(argvs, backPro);
+                    _exit(0);  // 如果 exec 出错，退出子进程
+                default: {  // 父进程
+                    Cpid = childPid;  // 保存子进程 ID
+                    int status;
+                    setpgid(childPid, childPid);  // 设置子进程的进程组 ID
+                    if (tcsetpgrp(shell_terminal, Cpid) == 0) {  // 将子进程设置为前台进程
+                        if ((waitpid(Cpid, &status, WUNTRACED)) < 0) {
+                            perror("wait failed");
+                            _exit(2);
+                        }
+                        printf("\n");
+                        // 恢复 shell 的控制权
+                        signal(SIGTTOU, SIG_IGN);  // 忽略 SIGTTOU 信号
+                        if (tcsetpgrp(shell_terminal, shell_pgid) != 0)
+                            printf("切换到 shell 发生错误！\n");
+                        signal(SIGTTOU, SIG_DFL);  // 恢复默认的 SIGTTOU 处理
+                    } else {
+                        printf("tcsetpgrp 错误！\n");
+                    }
+                    break;
+                }
+            }
+
+            // 如果不是后台进程，等待子进程完成
+            if (!backPro) {
+                unused int ret = waitpid(-1, &sta, 0);
+            }
+        }
+
+        // 显示 shell 提示符
+        if (shell_is_interactive)
+            fprintf(stdout, "%d: ", ++line_num);
+
+        // 清理内存
+        tokens_destroy(argvs);
+    }
+
+    return 0;  // 退出 shell
 }
+
