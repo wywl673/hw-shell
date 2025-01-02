@@ -270,7 +270,7 @@ int run_program(struct tokens *tokens) {
         exit(1);
     }
 
-    // Parent process: Wait for child to complete
+    // Parent process: Wait for child to complete1
     if (wait(NULL) == -1) {
         shell_msg("wait: %s\n", strerror(errno));
         return -1;
